@@ -64,22 +64,31 @@ char *ids_a_cadena_ordenada(int *ids, int n) {
     return s;
 }
 
-/* Elección del rey según el hash y el tiempo común */
-int elegir_rey(int n, int *ids_union, int n_union, uint64_t tiempo_comun) {
-    char *cadena = ids_a_cadena_ordenada(ids_union, n_union);
-    uint64_t hash_base = fnv1a_hash((unsigned char*)cadena, strlen(cadena));
-    free(cadena);
-
-    uint64_t mejor_valor = UINT64_MAX;
-    int rey = 0;
-
-    for (int id = 0; id < n; ++id) {
-        uint64_t valor = hash_base + tiempo_comun + (uint64_t)id;
-        if (valor < mejor_valor) {
-            mejor_valor = valor;
-            rey = id;
+int elegir_rey_coordinado(int n, int *ids_union, int n_union, int rank) {
+    int rey;
+    
+    if (rank == 0) {
+        // Solo el nodo 0 calcula el rey de manera determinista
+        long tiempo_comun = (long)time(NULL);
+        // Hash basado en IDs de nodos que no alcanzaron consenso
+        char *cadena = ids_a_cadena_ordenada(ids_union, n_union);
+        uint64_t hash_base = fnv1a_hash((unsigned char*)cadena, strlen(cadena));
+        free(cadena);
+        // Combinar hash + tiempo del sistema y elegir nodo con valor más bajo
+        uint64_t mejor_valor = UINT64_MAX;
+        rey = 0;
+        
+        for (int id = 0; id < n; ++id) {
+            uint64_t valor = hash_base + (uint64_t)tiempo_comun + (uint64_t)id;
+            if (valor < mejor_valor) {
+                mejor_valor = valor;
+                rey = id;
+            }
         }
     }
+    
+    // Compartir el rey con todos los nodos - GARANTIZA CONSISTENCIA
+    MPI_Bcast(&rey, 1, MPI_INT, 0, MPI_COMM_WORLD);
     return rey;
 }
 
@@ -107,7 +116,6 @@ int main(int argc, char **argv) {
     int f, max_rondas;
     unsigned long semilla;
     leer_argumentos(argc, argv, &f, &max_rondas, &semilla);
-
     if (f < 0) {
         if (rank == 0) fprintf(stderr, "Uso: %s -f <num_traidores> -r <max_rondas> [-s <semilla>]\n", argv[0]);
         MPI_Finalize();
@@ -152,7 +160,14 @@ int main(int argc, char **argv) {
     int soy_traidor = traidores[rank];
 
     // Plan inicial: cada nodo elige ataque o retirads al azar
-    int mi_valor = (rand() % 2) ? VAL_ATAQUE : VAL_RETIRADA;
+    int mi_valor;
+    if (soy_traidor) {
+        // Traidores tienen preferencia por ATAQUE para crear conflicto
+        mi_valor = (rand() % 100 < 70) ? VAL_ATAQUE : VAL_RETIRADA;
+    } else {
+        // Leales más balanceados
+        mi_valor = (rand() % 100 < 50) ? VAL_ATAQUE : VAL_RETIRADA;  // 50/50 exacto
+    }
     int valor_final = mi_valor;
 
     if (rank == 0) {
@@ -167,11 +182,12 @@ int main(int argc, char **argv) {
     int consenso = 0;
 
     for (int ronda = 1; ronda <= max_rondas && !consenso; ++ronda) {
+        ronda = ronda;
         // Comunicación entre todos los nodos
         for (int dest = 0; dest < n; ++dest) {
             if (dest == rank) continue;
-
             int enviar;
+            
             if (soy_traidor)
                 enviar = rand() % 2;  // Traidor manda valores aleatorios
             else
@@ -215,23 +231,19 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n; ++i)
             if (global_presencia[i]) union_ids[n_union++] = i;
 
-        // Obtener tiempo común para todos los nodos
-        long tiempo_local = (long)time(NULL) + (rand() % 10);
-        long suma_tiempo;
-        MPI_Allreduce(&tiempo_local, &suma_tiempo, 1, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
-        uint64_t tiempo_comun = (uint64_t)suma_tiempo;
+        //Elegir al rey después de cada ronda sin consenso
+        int rey = elegir_rey_coordinado(n, union_ids, n_union, rank);
 
-        // Elegir rey con base en el hash + tiempo
-        int rey = elegir_rey(n, union_ids, n_union, tiempo_comun);
-
-        // Fase 2: el rey envía su valor
         int valor_rey;
         if (rank == rey) {
-            if (soy_traidor)
-                valor_rey = rand() % 2;
-            else
+            if (soy_traidor) {
+                // Rey traidor elige estratégicamente
+                valor_rey = rand() % 2;  // Información arbitraria
+            } else {
                 valor_rey = mayoria_valor;
+            }
         }
+
 
         if (rank == rey) {
             for (int dest = 0; dest < n; ++dest)
@@ -262,7 +274,8 @@ int main(int argc, char **argv) {
                 printf(" Ronda %d: CONSENSO alcanzado → %s\n",
                        ronda, valor_final == VAL_ATAQUE ? "ATAQUE" : "RETIRADA");
         } else if (rank == 0) {
-            printf(" Ronda %d: sin consenso, nuevo rey: %d\n", ronda, rey);
+            printf("  Ronda %d: Sin consenso. Rey elegido: %d (Votos: Ataque=%d, Retirada=%d)\n", 
+                   ronda, rey, cuenta_ataque, cuenta_retirada);
         }
 
         free(no_consenso);
@@ -270,6 +283,12 @@ int main(int argc, char **argv) {
         free(global_presencia);
         free(union_ids);
         free(todos);
+    }
+
+    // REQUISITO 4: Reportar resultado final
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (!consenso && rank == 0) {
+        printf("✗ Máximo de rondas (%d) alcanzado SIN CONSENSO\n", max_rondas);
     }
 
     // ---- Reporte final por nodo ----
